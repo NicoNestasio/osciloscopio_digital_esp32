@@ -96,11 +96,12 @@ void vTriggerTask(void *pvParameters) {
             TickType_t ahora = xTaskGetTickCount();
             
             // Limitamos la transmisión UART para no colapsar la conexión
-            if ((ahora - ultimo_dibujo) > pdMS_TO_TICKS(30)) {
+            if ((ahora - ultimo_dibujo) > pdMS_TO_TICKS(150)) {
                 
                 int indice_del_disparo = -1;
                 
                 // 1. ZONA SEGURA: Buscamos solo donde los 400 puntos entran perfectos
+                // Evitamos mirar los bordes del buffer para que la ventana nunca se recorte.
                 int inicio_busqueda = PUNTOS_PANTALLA / 2;
                 int fin_busqueda = NUM_MUESTRAS - (PUNTOS_PANTALLA / 2);
 
@@ -111,29 +112,36 @@ void vTriggerTask(void *pvParameters) {
                     if (flanco_trigger == FLANCO_ASCENDENTE) {
                         if (anterior < (nivel_trigger - HISTERESIS) && actual >= (nivel_trigger + HISTERESIS)) {
                             indice_del_disparo = i;
-                            break; // Primer flanco encontrado, aseguramos fase estable
+                            break; // Primer flanco encontrado en zona segura
                         }
                     } else {
                         if (anterior > (nivel_trigger + HISTERESIS) && actual <= (nivel_trigger - HISTERESIS)) {
                             indice_del_disparo = i;
-                            break; // Primer flanco encontrado, aseguramos fase estable
+                            break; // Primer flanco encontrado en zona segura
                         }
                     }
                 }
 
-                // 2. ENCUADRE Y TRANSMISIÓN
-                if (indice_del_disparo != -1) {
-                    
-                    int inicio = indice_del_disparo - (PUNTOS_PANTALLA / 2);
-                    int fin = indice_del_disparo + (PUNTOS_PANTALLA / 2);
-
-                    // Formato ASCII clásico directo a SerialPlot
-                    for (int i = inicio; i < fin; i++) {
-                        printf("%"PRIu32"\n", (uint32_t)buffer_a_procesar[i]);
-                    }
-                    
-                    ultimo_dibujo = xTaskGetTickCount(); // Actualizamos el reloj
+                // =======================================================
+                // ¡NUEVO! MODO AUTO (Auto-Trigger Fallback)
+                // Si revisó todo el buffer y no hubo cruce con el nivel,
+                // forzamos el índice al centro para actualizar la pantalla.
+                // =======================================================
+                if (indice_del_disparo == -1) {
+                    indice_del_disparo = NUM_MUESTRAS / 2;
                 }
+
+                // 2. ENCUADRE Y TRANSMISIÓN
+                // Como tenemos la Zona Segura o el Modo Auto, esta matemática es 100% a prueba de fallos.
+                int inicio = indice_del_disparo - (PUNTOS_PANTALLA / 2);
+                int fin = indice_del_disparo + (PUNTOS_PANTALLA / 2);
+
+                // Imprimimos la ventana estricta de 400 puntos
+                for (int i = inicio; i < fin; i++) {
+                    printf("%"PRIu32"\n", (uint32_t)buffer_a_procesar[i]);
+                }
+                
+                ultimo_dibujo = xTaskGetTickCount(); // Actualizamos el reloj
             }
         }
     }
