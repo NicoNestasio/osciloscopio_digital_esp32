@@ -5,8 +5,10 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_adc/adc_continuous.h"
+#include "driver/ledc.h"
+#include "driver/uart.h"
 
 // ====================================================================
 // CONFIGURACIONES GENERALES DEL PERIFÉRICO
@@ -15,68 +17,137 @@
 #define EXAMPLE_ADC_CONV_MODE        ADC_CONV_SINGLE_UNIT_1
 #define EXAMPLE_ADC_ATTEN            ADC_ATTEN_DB_12
 #define EXAMPLE_ADC_BIT_WIDTH        SOC_ADC_DIGI_MAX_BITWIDTH
-#define EXAMPLE_READ_LEN            256 
 
-// Canal Seguro para ESP32-S3: ADC1_CH2 corresponde físicamente al GPIO 3
+#define EXAMPLE_READ_LEN             4096 
+#define NUM_MUESTRAS                 2048
+#define PUNTOS_PANTALLA              400 
+
 static adc_channel_t channel[1] = {ADC_CHANNEL_6}; 
-
-// Handles de las Tareas de FreeRTOS
 static TaskHandle_t xAdcTaskHandle = NULL;
 static TaskHandle_t xTriggerTaskHandle = NULL;
 
-// Semáforos Binarios de Sincronización (Según tu diagrama de bloques)
-static SemaphoreHandle_t set_trigger_event = NULL;
-static SemaphoreHandle_t set_ADC_event = NULL;
+// Usaremos una sola cola para pasar los punteros de memoria
+static QueueHandle_t cola_llenos = NULL;
 
-// Recursos y Memoria Compartida
-#define COLA_MUESTRAS_MAX 64
-static uint16_t buffer_compartido_muestras[COLA_MUESTRAS_MAX];
-static uint32_t ultima_muestra_analizada = 0;
+// ====================================================================
+// VARIABLES GLOBALES (Protección contra Stack Overflow y Watchdog)
+// ====================================================================
+static uint8_t hardware_read_buffer[EXAMPLE_READ_LEN];
+static adc_continuous_data_t parsed_data_buffer[EXAMPLE_READ_LEN / SOC_ADC_DIGI_RESULT_BYTES];
 
-// Prototipo de la función de inicialización del hardware
+// Doble buffer Ping-Pong estático en RAM global
+static uint16_t buffer_A[NUM_MUESTRAS];
+static uint16_t buffer_B[NUM_MUESTRAS];
+
+// Parámetros del Trigger
+volatile uint32_t nivel_trigger = 2000;
+#define HISTERESIS 100 // Filtro de ruido para los flancos
+
+typedef enum { FLANCO_ASCENDENTE = 0, FLANCO_DESCENDENTE = 1 } tipo_flanco_t;
+volatile tipo_flanco_t flanco_trigger = FLANCO_DESCENDENTE; 
+
+// ====================================================================
+// GENERADOR DE SEÑAL DE PRUEBA (PWM a 50Hz)
+// ====================================================================
+#define PWM_OUTPUT_GPIO    5   
+#define PWM_FREQ_HZ        50  
+
+static void init_pwm_test_signal(void) {
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .timer_num        = LEDC_TIMER_0,
+        .duty_resolution  = LEDC_TIMER_10_BIT, 
+        .freq_hz          = PWM_FREQ_HZ,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .speed_mode     = LEDC_LOW_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_0,
+        .timer_sel      = LEDC_TIMER_0,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .gpio_num       = PWM_OUTPUT_GPIO,
+        .duty           = 512, 
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
+
 static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc_continuous_handle_t *out_handle);
 
-// ====================================================================
-// ISR_DMA: Interrupción por hardware al completarse un frame (256 bytes)
-// ====================================================================
-static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
-{
+static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data) {
     BaseType_t mustYield = pdFALSE;
-    // Envía una notificación directa de alta velocidad a la Tarea_ADC
     vTaskNotifyGiveFromISR(xAdcTaskHandle, &mustYield);
     return (mustYield == pdTRUE);
 }
 
 // ====================================================================
-// TAREA TRIGGER (Prioridad 4 - Procesamiento Matemático Concurrente)
+// TAREA 2: TRIGGER Y UART (El Consumidor)
 // ====================================================================
 void vTriggerTask(void *pvParameters) {
-    while(1) {
-        // Se bloquea de forma eficiente esperando que Tarea_ADC cargue muestras nuevas
-        if (xSemaphoreTake(set_trigger_event, portMAX_DELAY) == pdTRUE) {
-            
-            for (int i = 0; i < COLA_MUESTRAS_MAX; i++) {
-                uint32_t muestra_actual = buffer_compartido_muestras[i];
+    uint16_t* buffer_a_procesar;
+    TickType_t ultimo_dibujo = 0;
 
-                // Algoritmo de Trigger: Busca cruce por umbral medio (2048) en flanco de subida
-                if (muestra_actual > 2048 && ultima_muestra_analizada <= 2048) {
-                    // Da luz verde a la Tarea_ADC para que libere la ráfaga
-                    xSemaphoreGive(set_ADC_event);
-                    break; // Corta el bucle para evitar falsos disparos múltiples en el mismo lote
+    while(1) {
+        // La tarea duerme profundamente hasta recibir un puntero del ADC
+        if (xQueueReceive(cola_llenos, &buffer_a_procesar, portMAX_DELAY) == pdTRUE) {
+            
+            TickType_t ahora = xTaskGetTickCount();
+            
+            // Limitamos la transmisión UART para no colapsar la conexión
+            if ((ahora - ultimo_dibujo) > pdMS_TO_TICKS(30)) {
+                
+                int indice_del_disparo = -1;
+                
+                // 1. ZONA SEGURA: Buscamos solo donde los 400 puntos entran perfectos
+                int inicio_busqueda = PUNTOS_PANTALLA / 2;
+                int fin_busqueda = NUM_MUESTRAS - (PUNTOS_PANTALLA / 2);
+
+                for (int i = inicio_busqueda; i < fin_busqueda; i++) {
+                    uint32_t anterior = buffer_a_procesar[i - 1];
+                    uint32_t actual   = buffer_a_procesar[i];
+
+                    if (flanco_trigger == FLANCO_ASCENDENTE) {
+                        if (anterior < (nivel_trigger - HISTERESIS) && actual >= (nivel_trigger + HISTERESIS)) {
+                            indice_del_disparo = i;
+                            break; // Primer flanco encontrado, aseguramos fase estable
+                        }
+                    } else {
+                        if (anterior > (nivel_trigger + HISTERESIS) && actual <= (nivel_trigger - HISTERESIS)) {
+                            indice_del_disparo = i;
+                            break; // Primer flanco encontrado, aseguramos fase estable
+                        }
+                    }
                 }
-                ultima_muestra_analizada = muestra_actual;
+
+                // 2. ENCUADRE Y TRANSMISIÓN
+                if (indice_del_disparo != -1) {
+                    
+                    int inicio = indice_del_disparo - (PUNTOS_PANTALLA / 2);
+                    int fin = indice_del_disparo + (PUNTOS_PANTALLA / 2);
+
+                    // Formato ASCII clásico directo a SerialPlot
+                    for (int i = inicio; i < fin; i++) {
+                        printf("%"PRIu32"\n", (uint32_t)buffer_a_procesar[i]);
+                    }
+                    
+                    ultimo_dibujo = xTaskGetTickCount(); // Actualizamos el reloj
+                }
             }
         }
     }
 }
 
 // ====================================================================
-// TAREA ADC (Prioridad 4 - Adquisición por DMA y Transmisión Serie)
+// TAREA 1: ADC (El Productor Ininterrumpido)
 // ====================================================================
 void vAdcTask(void *pvParameters) {
     esp_err_t ret;
     uint32_t ret_num = 0;
-    uint8_t result[EXAMPLE_READ_LEN] = {0};
+    
+    uint16_t* buffer_activo = buffer_A; 
+    int muestras_acumuladas = 0;
 
     adc_continuous_handle_t handle = NULL;
     continuous_adc_init(channel, 1, &handle); 
@@ -86,45 +157,37 @@ void vAdcTask(void *pvParameters) {
     ESP_ERROR_CHECK(adc_continuous_start(handle));
 
     while (1) {
-        // Bloqueo total (0% CPU) hasta que la ISR de hardware de aviso
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         while (1) {
-            ret = adc_continuous_read(handle, result, EXAMPLE_READ_LEN, &ret_num, 0);
+            ret = adc_continuous_read(handle, hardware_read_buffer, EXAMPLE_READ_LEN, &ret_num, 0);
             
             if (ret == ESP_OK) {
-                uint32_t samples_count = ret_num / SOC_ADC_DIGI_RESULT_BYTES;
-                adc_continuous_data_t parsed_data[samples_count];
                 uint32_t num_parsed_samples = 0;
-
-                esp_err_t parse_ret = adc_continuous_parse_data(handle, result, ret_num, parsed_data, &num_parsed_samples);
+                esp_err_t parse_ret = adc_continuous_parse_data(handle, hardware_read_buffer, ret_num, parsed_data_buffer, &num_parsed_samples);
                 
                 if (parse_ret == ESP_OK) {
-                    // 1. Resguardo de muestras analógicas válidas en memoria compartida
-                    for (int i = 0; i < num_parsed_samples && i < COLA_MUESTRAS_MAX; i++) {
-                        if (parsed_data[i].valid) {
-                            buffer_compartido_muestras[i] = parsed_data[i].raw_data;
-                        }
-                    }
+                    for (int i = 0; i < num_parsed_samples; i++) {
+                        if (parsed_data_buffer[i].valid) {
+                            
+                            buffer_activo[muestras_acumuladas] = parsed_data_buffer[i].raw_data;
+                            muestras_acumuladas++;
 
-                    // 2. Despierta a la Tarea_Trigger de inmediato entregando el semáforo
-                    xSemaphoreGive(set_trigger_event);
-
-                    // 3. SINCRONIZACIÓN DETERMINISTA: Cede la CPU y espera hasta 10ms la decisión del Trigger
-                    if (xSemaphoreTake(set_ADC_event, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        
-                        // ¡DISPARO CONFIRMADO! Envía la ráfaga a SerialPlot de inmediato
-                        for (int i = 0; i < num_parsed_samples && i < COLA_MUESTRAS_MAX; i++) {
-                            if (parsed_data[i].valid) {
-                                // Agregamos el cast (uint32_t) para que coincida con la macro PRIu32
-                                printf("%"PRIu32"\n", (uint32_t)buffer_compartido_muestras[i]);
+                            if (muestras_acumuladas >= NUM_MUESTRAS) {
+                                
+                                // Mandamos el buffer a la cola (tiempo de espera 0)
+                                if (xQueueSend(cola_llenos, &buffer_activo, 0) == pdPASS) {
+                                    // Cambiamos de buffer (Ping-Pong)
+                                    buffer_activo = (buffer_activo == buffer_A) ? buffer_B : buffer_A;
+                                }
+                                
+                                // Reseteamos contador. Si el Trigger estaba ocupado, se sobreescribe pacíficamente.
+                                muestras_acumuladas = 0;
                             }
                         }
                     }
-                    // Si pasaron los 10ms y el trigger no dio el OK, el lote se ignora (Efecto congelado)
                 }
             } else if (ret == ESP_ERR_TIMEOUT) {
-                // Buffer de hardware vacío, rompe el bucle interno y vuelve a esperar la ISR
                 break;
             }
         }
@@ -132,44 +195,41 @@ void vAdcTask(void *pvParameters) {
 }
 
 // ====================================================================
-// TAREA MAIN (Configuradora e Inicializadora del Sistema)
+// TAREA MAIN 
 // ====================================================================
-void app_main(void)
-{
-    // Creación segura de los semáforos binarios
-    set_trigger_event = xSemaphoreCreateBinary();
-    set_ADC_event = xSemaphoreCreateBinary();
+void app_main(void) {
+    init_pwm_test_signal();
+    uart_set_baudrate(UART_NUM_0, 921600);
 
-    // Lanzamiento de las tareas concurrentes compartiendo la misma prioridad alta (4)
-    xTaskCreate(vAdcTask, "Tarea_ADC", 4096, NULL, 4, &xAdcTaskHandle);
-    xTaskCreate(vTriggerTask, "Tarea_Trigger", 4096, NULL, 4, &xTriggerTaskHandle);
+    // Cola con capacidad para 1 solo puntero. Actúa como sincronizador no bloqueante.
+    cola_llenos = xQueueCreate(1, sizeof(uint16_t*));
+
+    xTaskCreatePinnedToCore(vAdcTask, "Tarea_ADC", 8192, NULL, 4, &xAdcTaskHandle, 0);
+    xTaskCreatePinnedToCore(vTriggerTask, "Tarea_Trigger", 8192, NULL, 4, &xTriggerTaskHandle, 1);
 }
 
 // ====================================================================
-// INICIALIZACIÓN INTERNA DEL DRIVER DE ESP-IDF
+// INICIALIZACIÓN DEL ADC
 // ====================================================================
 static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc_continuous_handle_t *out_handle) {
     adc_continuous_handle_t handle = NULL;
-    
     adc_continuous_handle_cfg_t adc_config = {
-        .max_store_buf_size = 1024,
+        .max_store_buf_size = 8192,
         .conv_frame_size = EXAMPLE_READ_LEN,
     };
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 1 * 1000, // Fijado a 1 kHz para control analógico estable
+        .sample_freq_hz = 20000, 
         .conv_mode = EXAMPLE_ADC_CONV_MODE,
     };
     
     adc_digi_pattern_config_t adc_pattern[1] = {0};
     dig_cfg.pattern_num = channel_num;
-    
     adc_pattern[0].atten = EXAMPLE_ADC_ATTEN;
     adc_pattern[0].channel = channel[0] & 0x7;
     adc_pattern[0].unit = EXAMPLE_ADC_UNIT;
     adc_pattern[0].bit_width = EXAMPLE_ADC_BIT_WIDTH;
-    
     dig_cfg.adc_pattern = adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(handle, &dig_cfg));
     *out_handle = handle;
