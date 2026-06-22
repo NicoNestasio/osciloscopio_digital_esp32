@@ -7,7 +7,7 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 # ==========================================
 # CONFIGURACIÓN DEL SISTEMA
 # ==========================================
-PUERTO = 'COM11'
+PUERTO = 'COM11'  # <-- Asegurate de que sea el puerto de tu ESP32
 BAUDIOS = 921600
 PUNTOS_PANTALLA = 400
 V_REF = 3.3 
@@ -23,28 +23,32 @@ except Exception as e:
 # ==========================================
 # CÁLCULO DEL EJE X (TIEMPO)
 # ==========================================
-# Creamos un arreglo que va de 0 a 19.95 ms, con pasos de 0.05 ms (50 us)
 x_tiempo_ms = np.arange(PUNTOS_PANTALLA) * (1000.0 / FS)
+
+# Variables globales para almacenar la configuración del instrumento
+flanco_trigger = 1
+nivel_trigger = 2000
+tiempo_div_ms = 5
+amplitud_div_v = 3.3
 
 # ==========================================
 # CONFIGURACIÓN DE LA INTERFAZ GRÁFICA
 # ==========================================
 app = QtWidgets.QApplication([])
 win = QtWidgets.QWidget()
-win.setWindowTitle("Osciloscopio Digital ESP32")
-win.resize(1000, 650)
+win.setWindowTitle("Osciloscopio Digital ESP32 - Control en Tiempo Real")
+win.resize(1100, 700)
 win.setStyleSheet("background-color: #121212;")
 
-# Creamos un Layout Vertical para apilar el texto arriba y el gráfico abajo
 layout = QtWidgets.QVBoxLayout()
 win.setLayout(layout)
 
-# 1. Panel Superior (Display de Estadísticas)
-panel_stats = QtWidgets.QLabel("Esperando señal...")
+# Panel Superior Dinámico
+panel_stats = QtWidgets.QLabel("Esperando señal y sincronización...")
 panel_stats.setAlignment(QtCore.Qt.AlignCenter)
 panel_stats.setStyleSheet("""
     font-family: monospace; 
-    font-size: 16pt; 
+    font-size: 13pt; 
     font-weight: bold;
     background-color: #1e1e1e; 
     color: white; 
@@ -54,10 +58,10 @@ panel_stats.setStyleSheet("""
 """)
 layout.addWidget(panel_stats)
 
-# 2. Lienzo del Gráfico (Abajo)
+# Lienzo del Gráfico
 plot = pg.PlotWidget(title="Adquisición en Tiempo Real")
 plot.setYRange(0, 3.5)
-plot.setXRange(0, x_tiempo_ms[-1]) # Bloqueamos el eje X entre 0 y 20 ms
+plot.setXRange(0, x_tiempo_ms[-1]) 
 plot.showGrid(x=True, y=True, alpha=0.5)
 
 plot.setLabel('left', 'Tensión', units='V')
@@ -69,16 +73,14 @@ curve = plot.plot(pen=pg.mkPen('c', width=2))
 # ==========================================
 # CURSORES MÓVILES
 # ==========================================
-# Cursor de Tensión (Horizontal)
 cursor_v = pg.InfiniteLine(
     angle=0, movable=True, pos=1.65, 
     pen=pg.mkPen('y', style=QtCore.Qt.DashLine),
-    label='{value:.2f} V', 
+    label='Trig: {value:.2f} V', 
     labelOpts={'color': 'y', 'position': 0.05, 'fill': pg.mkBrush(0, 0, 0, 200)}
 )
 plot.addItem(cursor_v)
 
-# Cursor de Tiempo (Vertical) - Inicia en el centro (10 ms)
 cursor_t = pg.InfiniteLine(
     angle=90, movable=True, pos=10.0, 
     pen=pg.mkPen('m', style=QtCore.Qt.DashLine),
@@ -93,36 +95,65 @@ buffer_datos = []
 # FUNCIÓN DE LECTURA Y ACTUALIZACIÓN
 # ==========================================
 def actualizar_grafico():
-    global buffer_datos
+    global buffer_datos, flanco_trigger, nivel_trigger, tiempo_div_ms, amplitud_div_v
     
-    while ser.in_waiting > 0:
-        try:
+    try:
+        lineas_leidas = 0
+        # Válvula de escape: Máximo 1000 líneas por ciclo para no asfixiar la GUI
+        while ser.in_waiting > 0 and lineas_leidas < 1000:
             linea = ser.readline().decode('ascii').strip()
-            if linea.isdigit():
-                buffer_datos.append(int(linea))
-        except UnicodeDecodeError:
-            pass 
+            lineas_leidas += 1
             
+            # --- PARSEO DE LA CABECERA DE SINCRONIZACIÓN ---
+            if linea.startswith("SYNC"):
+                partes = linea.split(',')
+                if len(partes) >= 5:
+                    flanco_trigger = int(partes[1])
+                    nivel_trigger = int(partes[2])
+                    tiempo_div_ms = int(partes[3])
+                    amplitud_div_v = float(partes[4])
+                    
+                    # Movemos el cursor horizontal de voltaje automáticamente
+                    voltios_trigger = nivel_trigger * (V_REF / 4095.0)
+                    cursor_v.setValue(voltios_trigger)
+                    
+            elif linea.isdigit():
+                buffer_datos.append(int(linea))
+                
+    except (UnicodeDecodeError, ValueError):
+        pass 
+    except serial.SerialException:
+        # Si desconectás el cable, detenemos el reloj y avisamos sin trabar el programa
+        timer.stop()
+        panel_stats.setText("<span style='color: #FF5555; font-size: 20pt;'>⚠️ CONEXIÓN PERDIDA (Cable desconectado o ESP32 Reiniciado) ⚠️</span>")
+        return
+            
+    # Dibujado de la pantalla
     if len(buffer_datos) >= PUNTOS_PANTALLA:
         ventana_cruda = buffer_datos[-PUNTOS_PANTALLA:]
+        
+        # Limpiamos TODO el buffer para evitar que se acumule lag ("retraso" de la señal)
         buffer_datos.clear()
         
-        # Conversión a tensión
         y_volts = np.array(ventana_cruda) * (V_REF / 4095.0)
-        
-        # Le pasamos tanto el eje X (tiempo) como el eje Y (tensión)
         curve.setData(x_tiempo_ms, y_volts)
         
-        # Cálculos de picos
+        # Cálculos de picos de señal
         v_max = np.max(y_volts)
         v_min = np.min(y_volts)
         v_pp = v_max - v_min
         
-        # Actualizamos el panel superior (con colores HTML)
+        # Traducimos el flag del flanco a texto
+        txt_flanco = "SUBIDA" if flanco_trigger == 0 else "BAJADA"
+        
+        # Display HTML con escalas dinámicas
         stats_html = f"""
-            <span style='color: #FF5555; margin-right: 30px;'>Vmax: {v_max:.2f} V</span>
-            <span style='color: #5555FF; margin-right: 30px;'>Vmin: {v_min:.2f} V</span>
-            <span style='color: #55FF55;'>Vpp: {v_pp:.2f} V</span>
+            <span style='color: #FF5555; margin-right: 20px;'>Vmax: {v_max:.2f}V</span>
+            <span style='color: #5555FF; margin-right: 20px;'>Vmin: {v_min:.2f}V</span>
+            <span style='color: #55FF55; margin-right: 40px;'>Vpp: {v_pp:.2f}V</span>
+            <span style='color: #FFFF55; margin-right: 20px;'>| T: {tiempo_div_ms}ms/div</span>
+            <span style='color: #00FFFF; margin-right: 20px;'>A: {amplitud_div_v}V/div</span>
+            <span style='color: #FF00FF;'>Flanco: {txt_flanco}</span>
         """
         panel_stats.setText(stats_html)
 
@@ -132,7 +163,7 @@ timer.start(10)
 
 if __name__ == '__main__':
     print("Iniciando osciloscopio... (Cerrá la ventana para salir)")
-    win.show() # Usamos win.show() en lugar de arrancar el GraphicsLayoutWidget
+    win.show() 
     QtWidgets.QApplication.instance().exec_()
     ser.close()
     print("Puerto serie cerrado.")
