@@ -7,11 +7,10 @@ from pyqtgraph.Qt import QtWidgets, QtCore
 # ==========================================
 # CONFIGURACIÓN DEL SISTEMA
 # ==========================================
-PUERTO = 'COM11'  # <-- Asegurate de que sea el puerto de tu ESP32
+PUERTO = 'COM11' # <-- REVISAR Y CAMBIAR AL COM DE TU ESP32
 BAUDIOS = 921600
 PUNTOS_PANTALLA = 400
 V_REF = 3.3 
-FS = 20000.0 # Frecuencia de muestreo en Hz (20 kHz)
 
 try:
     ser = serial.Serial(PUERTO, BAUDIOS, timeout=0.05)
@@ -20,23 +19,18 @@ except Exception as e:
     print(f"Error abriendo el puerto {PUERTO}: {e}")
     sys.exit(1)
 
-# ==========================================
-# CÁLCULO DEL EJE X (TIEMPO)
-# ==========================================
-x_tiempo_ms = np.arange(PUNTOS_PANTALLA) * (1000.0 / FS)
-
 # Variables globales para almacenar la configuración del instrumento
-flanco_trigger = 1
-nivel_trigger = 2000
-tiempo_div_ms = 5
-amplitud_div_v = 3.3
+flanco_trigger = 0
+nivel_trigger = 2048
+tiempo_div_ms = 50
+amplitud_div_v = 1.0
 
 # ==========================================
 # CONFIGURACIÓN DE LA INTERFAZ GRÁFICA
 # ==========================================
 app = QtWidgets.QApplication([])
 win = QtWidgets.QWidget()
-win.setWindowTitle("Osciloscopio Digital ESP32 - Control en Tiempo Real")
+win.setWindowTitle("Osciloscopio Digital ESP32 - Grilla 10x10")
 win.resize(1100, 700)
 win.setStyleSheet("background-color: #121212;")
 
@@ -44,7 +38,7 @@ layout = QtWidgets.QVBoxLayout()
 win.setLayout(layout)
 
 # Panel Superior Dinámico
-panel_stats = QtWidgets.QLabel("Esperando señal y sincronización...")
+panel_stats = QtWidgets.QLabel("Esperando señal...")
 panel_stats.setAlignment(QtCore.Qt.AlignCenter)
 panel_stats.setStyleSheet("""
     font-family: monospace; 
@@ -60,8 +54,6 @@ layout.addWidget(panel_stats)
 
 # Lienzo del Gráfico
 plot = pg.PlotWidget(title="Adquisición en Tiempo Real")
-plot.setYRange(0, 3.5)
-plot.setXRange(0, x_tiempo_ms[-1]) 
 plot.showGrid(x=True, y=True, alpha=0.5)
 
 plot.setLabel('left', 'Tensión', units='V')
@@ -81,15 +73,21 @@ cursor_v = pg.InfiniteLine(
 )
 plot.addItem(cursor_v)
 
-cursor_t = pg.InfiniteLine(
-    angle=90, movable=True, pos=10.0, 
-    pen=pg.mkPen('m', style=QtCore.Qt.DashLine),
-    label='{value:.2f} ms', 
-    labelOpts={'color': 'm', 'position': 0.95, 'fill': pg.mkBrush(0, 0, 0, 200)}
-)
-plot.addItem(cursor_t)
-
 buffer_datos = []
+
+# ==========================================
+# ENVÍO DE COMANDOS POR TECLADO
+# ==========================================
+def manejar_teclado(event):
+    tecla = event.text().lower()
+    if tecla in ['t', 'a', 'f', '+', '-']:
+        try:
+            ser.write(tecla.encode('ascii'))
+            print(f"Comando enviado al micro: {tecla}")
+        except Exception as e:
+            print(f"Error al enviar comando: {e}")
+
+win.keyPressEvent = manejar_teclado
 
 # ==========================================
 # FUNCIÓN DE LECTURA Y ACTUALIZACIÓN
@@ -99,12 +97,10 @@ def actualizar_grafico():
     
     try:
         lineas_leidas = 0
-        # Válvula de escape: Máximo 1000 líneas por ciclo para no asfixiar la GUI
         while ser.in_waiting > 0 and lineas_leidas < 1000:
             linea = ser.readline().decode('ascii').strip()
             lineas_leidas += 1
             
-            # --- PARSEO DE LA CABECERA DE SINCRONIZACIÓN ---
             if linea.startswith("SYNC"):
                 partes = linea.split(',')
                 if len(partes) >= 5:
@@ -113,9 +109,25 @@ def actualizar_grafico():
                     tiempo_div_ms = int(partes[3])
                     amplitud_div_v = float(partes[4])
                     
-                    # Movemos el cursor horizontal de voltaje automáticamente
                     voltios_trigger = nivel_trigger * (V_REF / 4095.0)
                     cursor_v.setValue(voltios_trigger)
+                    
+                    # =======================================================
+                    # MAGIA: EJE Y GRILLA FIJA 10x10 EN UNIDADES REALES
+                    # =======================================================
+                    
+                    # 1. Eje X: Rango de 0 a (10 divisiones * ms/div)
+                    rango_x = tiempo_div_ms * 10.0
+                    plot.setXRange(0, rango_x, padding=0)
+                    # Forzamos a PyQtGraph a poner una línea de grilla cada 'tiempo_div_ms'
+                    plot.getAxis('bottom').setTickSpacing(levels=[(tiempo_div_ms, 0)])
+
+                    # 2. Eje Y: Centramos en 1.65V, y damos 5 divisiones para arriba y 5 para abajo
+                    centro_y = 1.65
+                    rango_y_mitad = amplitud_div_v * 5.0
+                    plot.setYRange(centro_y - rango_y_mitad, centro_y + rango_y_mitad, padding=0)
+                    # Forzamos una línea de grilla cada 'amplitud_div_v'
+                    plot.getAxis('left').setTickSpacing(levels=[(amplitud_div_v, 0)])
                     
             elif linea.isdigit():
                 buffer_datos.append(int(linea))
@@ -123,30 +135,30 @@ def actualizar_grafico():
     except (UnicodeDecodeError, ValueError):
         pass 
     except serial.SerialException:
-        # Si desconectás el cable, detenemos el reloj y avisamos sin trabar el programa
         timer.stop()
-        panel_stats.setText("<span style='color: #FF5555; font-size: 20pt;'>⚠️ CONEXIÓN PERDIDA (Cable desconectado o ESP32 Reiniciado) ⚠️</span>")
+        panel_stats.setText("<span style='color: #FF5555; font-size: 20pt;'>⚠️ CONEXIÓN PERDIDA (Cable desconectado) ⚠️</span>")
         return
-            
+        
     # Dibujado de la pantalla
     if len(buffer_datos) >= PUNTOS_PANTALLA:
         ventana_cruda = buffer_datos[-PUNTOS_PANTALLA:]
-        
-        # Limpiamos TODO el buffer para evitar que se acumule lag ("retraso" de la señal)
         buffer_datos.clear()
         
-        y_volts = np.array(ventana_cruda) * (V_REF / 4095.0)
-        curve.setData(x_tiempo_ms, y_volts)
+        # Eje X dinámico que cubre las 10 divisiones en milisegundos reales
+        rango_x_total = tiempo_div_ms * 10.0
+        x_tiempo_ms_dinamico = np.linspace(0, rango_x_total, PUNTOS_PANTALLA)
         
-        # Cálculos de picos de señal
+        # Eje Y en voltios reales
+        y_volts = np.array(ventana_cruda) * (V_REF / 4095.0)
+        
+        curve.setData(x_tiempo_ms_dinamico, y_volts)
+        
         v_max = np.max(y_volts)
         v_min = np.min(y_volts)
         v_pp = v_max - v_min
         
-        # Traducimos el flag del flanco a texto
         txt_flanco = "SUBIDA" if flanco_trigger == 0 else "BAJADA"
         
-        # Display HTML con escalas dinámicas
         stats_html = f"""
             <span style='color: #FF5555; margin-right: 20px;'>Vmax: {v_max:.2f}V</span>
             <span style='color: #5555FF; margin-right: 20px;'>Vmin: {v_min:.2f}V</span>
@@ -163,6 +175,7 @@ timer.start(10)
 
 if __name__ == '__main__':
     print("Iniciando osciloscopio... (Cerrá la ventana para salir)")
+    print("Controles activos: 't' (Tiempo), 'a' (Amplitud), 'f' (Flanco), '+' y '-' (Nivel Trigger)")
     win.show() 
     QtWidgets.QApplication.instance().exec_()
     ser.close()

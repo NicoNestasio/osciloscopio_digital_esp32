@@ -13,7 +13,6 @@
 #include <stdbool.h>
 #include "ssd1306.h"
 #include "esp_adc/adc_continuous.h"
-#include "driver/ledc.h"
 #include "driver/uart.h"
 
 static const char *TAG = "OSCILOSCOPIO_FINAL";
@@ -25,7 +24,7 @@ static const char *TAG = "OSCILOSCOPIO_FINAL";
 #define EXAMPLE_PCNT_HIGH_LIMIT 100
 #define EXAMPLE_PCNT_LOW_LIMIT  -100
 #define EXAMPLE_EC11_GPIO_A 4
-#define EXAMPLE_EC11_GPIO_B 6
+#define EXAMPLE_EC11_GPIO_B 5
 #define BUTTON_GPIO 18
 
 // ADC
@@ -34,18 +33,20 @@ static const char *TAG = "OSCILOSCOPIO_FINAL";
 #define EXAMPLE_ADC_ATTEN            ADC_ATTEN_DB_12
 #define EXAMPLE_ADC_BIT_WIDTH        SOC_ADC_DIGI_MAX_BITWIDTH
 #define EXAMPLE_READ_LEN             4096 
-#define NUM_MUESTRAS                 2048
+#define NUM_MUESTRAS                 8192 // Ampliado para el diezmado
 #define PUNTOS_PANTALLA              400 
-
-// PWM (Señal de Prueba)
-#define PWM_OUTPUT_GPIO    5   
-#define PWM_FREQ_HZ        50  
-#define HISTERESIS         100
-
+#define HISTERESIS                   100
 // ====================================================================
 // 2. ESTRUCTURAS, TIPOS Y VARIABLES GLOBALES
 // ====================================================================
-typedef enum { ESTADO_MENU_PRINCIPAL, ESTADO_TIEMPO, ESTADO_AMPLITUD, ESTADO_TRIGGER } estado_menu_t;
+typedef enum { 
+    ESTADO_MENU_PRINCIPAL, 
+    ESTADO_TIEMPO, 
+    ESTADO_AMPLITUD, 
+    ESTADO_FLANCO, 
+    ESTADO_NIVEL_TRIG 
+} estado_menu_t;
+
 typedef enum { FLANCO_ASCENDENTE = 0, FLANCO_DESCENDENTE = 1 } tipo_flanco_t;
 
 // Estructura para el Mailbox de Configuración
@@ -71,7 +72,7 @@ typedef struct {
     float amplitud;
 } trama_uart_t;
 
-// Colas del Sistema (Nombres sincronizados con el diagrama)
+// Colas del Sistema
 static QueueHandle_t button_queue = NULL;      
 static QueueHandle_t full_queue = NULL;
 static QueueHandle_t Uart_queue = NULL;
@@ -115,12 +116,12 @@ void vButtonTask(void *pvParameters) {
     while (1) {
         if (xQueueReceive(button_queue, &io_num, portMAX_DELAY)) {
             TickType_t now = xTaskGetTickCount();
-            if ((now - last_press) > pdMS_TO_TICKS(250)) {
+            if ((now - last_press) > pdMS_TO_TICKS(250)) { // Debounce de 250ms
                 if (gpio_get_level(BUTTON_GPIO) == 0) {
                     boton_presionado = true; 
-                    last_press = xTaskGetTickCount();
+                    last_press = now;
                 }
-                xQueueReset(button_queue); 
+                xQueueReset(button_queue); // Limpiamos la cola para evitar múltiples pulsaciones rápidas 
             }
         }
     }
@@ -137,24 +138,37 @@ void vMenuTask(void *pvParameters) {
     int ultimo_conteo = 0;
     int conteo_actual = 0;
     bool refrescar_pantalla = true; 
+    
+    // Obtenemos la configuración inicial para modificar sobre ella
+    config_osciloscopio_t config_activa;
+    xQueuePeek(config_queue, &config_activa, portMAX_DELAY);
 
     while (1) {
         // LEER EL ENCODER
         ESP_ERROR_CHECK(pcnt_unit_get_count(pcnt_unit, &conteo_actual));
         int diferencia = conteo_actual - ultimo_conteo;
 
-        // DETECTAR EL GIRO
+        // DETECTAR EL GIRO (Sensibilidad ajustada a 4 pulsos por clic físico)
         if (diferencia >= 4 || diferencia <= -4) {
             int direccion = (diferencia >= 4) ? 1 : -1;
 
             if (estado_actual == ESTADO_MENU_PRINCIPAL) {
                 opcion_principal += direccion;
-                if (opcion_principal > 2) opcion_principal = 0; 
-                if (opcion_principal < 0) opcion_principal = 2;
-            } else {
+                if (opcion_principal > 3) opcion_principal = 0; 
+                if (opcion_principal < 0) opcion_principal = 3;
+            } 
+            else if (estado_actual == ESTADO_NIVEL_TRIG) {
+                // Modificación en tiempo real del nivel de trigger
+                if (direccion > 0 && config_activa.nivel <= 3800) config_activa.nivel += 200;
+                else if (direccion < 0 && config_activa.nivel >= 200) config_activa.nivel -= 200;
+                xQueueOverwrite(config_queue, &config_activa);
+            }
+            else {
                 sub_opcion += direccion;
-                if (sub_opcion > 2) sub_opcion = 0; 
-                if (sub_opcion < 0) sub_opcion = 2;
+                // Limitamos las opciones según el menú (Tiempo: 3, Amplitud: 2, Flanco: 2)
+                int max_opciones = (estado_actual == ESTADO_TIEMPO) ? 2 : 1; 
+                if (sub_opcion > max_opciones) sub_opcion = 0; 
+                if (sub_opcion < 0) sub_opcion = max_opciones;
             }
             ultimo_conteo = conteo_actual;
             refrescar_pantalla = true; 
@@ -165,72 +179,75 @@ void vMenuTask(void *pvParameters) {
             boton_presionado = false; 
             
             if (estado_actual == ESTADO_MENU_PRINCIPAL) {
+                // Entrar a un submenú
                 if (opcion_principal == 0) estado_actual = ESTADO_TIEMPO;
                 else if (opcion_principal == 1) estado_actual = ESTADO_AMPLITUD;
-                else if (opcion_principal == 2) estado_actual = ESTADO_TRIGGER;
+                else if (opcion_principal == 2) estado_actual = ESTADO_FLANCO;
+                else if (opcion_principal == 3) estado_actual = ESTADO_NIVEL_TRIG;
                 sub_opcion = 0; 
             } else {
-                // GUARDAR CONFIGURACIÓN EN EL MAILBOX (COLA)
-                config_osciloscopio_t nueva_config;
-                xQueuePeek(config_queue, &nueva_config, 0); // Leemos el estado actual
-
+                // Salir de un submenú y aplicar configuración (excepto Trigger que es en vivo)
                 if (estado_actual == ESTADO_TIEMPO) {
-                    if (sub_opcion == 0) nueva_config.tiempo_ms = 10;
-                    else if (sub_opcion == 1) nueva_config.tiempo_ms = 50;
-                    else if (sub_opcion == 2) nueva_config.tiempo_ms = 100;
+                    if (sub_opcion == 0) config_activa.tiempo_ms = 1;
+                    else if (sub_opcion == 1) config_activa.tiempo_ms = 2;
+                    else if (sub_opcion == 2) config_activa.tiempo_ms = 5;
                 } 
                 else if (estado_actual == ESTADO_AMPLITUD) {
-                    if (sub_opcion == 0) nueva_config.amplitud_v = 1.0;
-                    else if (sub_opcion == 1) nueva_config.amplitud_v = 3.3;
-                    else if (sub_opcion == 2) nueva_config.amplitud_v = 5.0;
+                    if (sub_opcion == 0) config_activa.amplitud_v = 1.0;
+                    else if (sub_opcion == 1) config_activa.amplitud_v = 5.0;
                 } 
-                else if (estado_actual == ESTADO_TRIGGER) {
-                    if (sub_opcion == 0) nueva_config.flanco = FLANCO_ASCENDENTE;
-                    else if (sub_opcion == 1) nueva_config.flanco = FLANCO_DESCENDENTE;
+                else if (estado_actual == ESTADO_FLANCO) {
+                    if (sub_opcion == 0) config_activa.flanco = FLANCO_ASCENDENTE;
+                    else if (sub_opcion == 1) config_activa.flanco = FLANCO_DESCENDENTE;
                 }
                 
-                // Sobrescribimos el buzón de forma segura
-                xQueueOverwrite(config_queue, &nueva_config);
-                
+                // Sobrescribimos el buzón para que el Trigger tome los cambios
+                xQueueOverwrite(config_queue, &config_activa);
                 estado_actual = ESTADO_MENU_PRINCIPAL;
             }
             refrescar_pantalla = true; 
         }
 
-        // DIBUJAR PANTALLA
+        // DIBUJAR PANTALLA OLED
         if (refrescar_pantalla) {
             ssd1306_clear_screen(dev, false);
+            char buffer_str[32];
 
             if (estado_actual == ESTADO_MENU_PRINCIPAL) {
                 ssd1306_display_text(dev, 0, "OSCILOSCOPIO", 13, false);
                 ssd1306_display_text(dev, 2, " Tiempo/div", 11, opcion_principal == 0);
                 ssd1306_display_text(dev, 3, " Amplitud/div", 13, opcion_principal == 1);
-                ssd1306_display_text(dev, 4, " Trigger", 8, opcion_principal == 2);
+                ssd1306_display_text(dev, 4, " Flanco Trig", 12, opcion_principal == 2);
+                ssd1306_display_text(dev, 5, " Nivel Trig", 11, opcion_principal == 3);
             }
             else if (estado_actual == ESTADO_TIEMPO) {
                 ssd1306_display_text(dev, 0, "> TIEMPO/DIV", 12, false);
-                ssd1306_display_text(dev, 2, " 10 ms", 6, sub_opcion == 0);
-                ssd1306_display_text(dev, 3, " 50 ms", 6, sub_opcion == 1);
-                ssd1306_display_text(dev, 4, " 100 ms", 7, sub_opcion == 2);
+                ssd1306_display_text(dev, 2, " 1 ms", 5, sub_opcion == 0);
+                ssd1306_display_text(dev, 3, " 2 ms", 5, sub_opcion == 1);
+                ssd1306_display_text(dev, 4, " 5 ms", 5, sub_opcion == 2);
             }
             else if (estado_actual == ESTADO_AMPLITUD) {
                 ssd1306_display_text(dev, 0, "> AMPLITUD", 10, false);
-                ssd1306_display_text(dev, 2, " 1 V/div", 8, sub_opcion == 0);
-                ssd1306_display_text(dev, 3, " 3.3 V/div", 10, sub_opcion == 1);
-                ssd1306_display_text(dev, 4, " 5 V/div", 8, sub_opcion == 2);
+                ssd1306_display_text(dev, 2, " 1.0 V/div", 10, sub_opcion == 0);
+                ssd1306_display_text(dev, 3, " 5.0 V/div", 10, sub_opcion == 1);
             }
-            else if (estado_actual == ESTADO_TRIGGER) {
-                ssd1306_display_text(dev, 0, "> TRIGGER", 9, false);
-                ssd1306_display_text(dev, 2, " Flanco Subida", 14, sub_opcion == 0);
-                ssd1306_display_text(dev, 3, " Flanco Bajada", 14, sub_opcion == 1);
-                ssd1306_display_text(dev, 4, " Apagado", 8, sub_opcion == 2);
+            else if (estado_actual == ESTADO_FLANCO) {
+                ssd1306_display_text(dev, 0, "> FLANCO TRIG", 13, false);
+                ssd1306_display_text(dev, 2, " Subida", 7, sub_opcion == 0);
+                ssd1306_display_text(dev, 3, " Bajada", 7, sub_opcion == 1);
+            }
+            else if (estado_actual == ESTADO_NIVEL_TRIG) {
+                ssd1306_display_text(dev, 0, "> NIVEL TRIG", 12, false);
+                sprintf(buffer_str, " Nivel: %"PRIu32, config_activa.nivel);
+                ssd1306_display_text(dev, 3, buffer_str, strlen(buffer_str), true);
+                ssd1306_display_text(dev, 5, " (Girar p/ajuste)", 17, false);
             }
 
             ssd1306_show_buffer(dev);
             refrescar_pantalla = false; 
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(30)); // 30ms para refresco fluido de interfaz
     }
 }
 
@@ -246,7 +263,7 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
     ESP_ERROR_CHECK(adc_continuous_new_handle(&adc_config, &handle));
 
     adc_continuous_config_t dig_cfg = {
-        .sample_freq_hz = 20000, 
+        .sample_freq_hz = 40000,  // Configurado a 40kHz para el diezmado matemático exacto
         .conv_mode = EXAMPLE_ADC_CONV_MODE,
         .format = ADC_DIGI_OUTPUT_FORMAT_TYPE2, 
     };
@@ -276,10 +293,10 @@ void vAdcTask(void *pvParameters) {
     ESP_ERROR_CHECK(adc_continuous_start(handle));
 
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // Espera a que la ISR del ADC notifique que hay datos disponibles
 
         while (1) {
-            ret = adc_continuous_read(handle, hardware_read_buffer, EXAMPLE_READ_LEN, &ret_num, 0);
+            ret = adc_continuous_read(handle, hardware_read_buffer, EXAMPLE_READ_LEN, &ret_num, 0); // 
             
             if (ret == ESP_OK) {
                 uint32_t num_parsed_samples = 0;
@@ -311,14 +328,13 @@ void vTriggerTask(void *pvParameters) {
     uint16_t* buffer_a_procesar;
     TickType_t ultimo_dibujo = 0;
     
-    // Variable local que copia la configuración actual
     config_osciloscopio_t mi_config;
     xQueuePeek(config_queue, &mi_config, portMAX_DELAY);
 
     while(1) {
         if (xQueueReceive(full_queue, &buffer_a_procesar, portMAX_DELAY) == pdTRUE) {
             
-            // Actualizamos la configuración si el Menú mandó algo nuevo (NO bloqueante)
+            // Actualizamos la configuración si el Menú mandó algo nuevo
             config_osciloscopio_t temp_cfg;
             if (xQueuePeek(config_queue, &temp_cfg, 0) == pdTRUE) {
                 mi_config = temp_cfg;
@@ -327,11 +343,15 @@ void vTriggerTask(void *pvParameters) {
             TickType_t ahora = xTaskGetTickCount();
             
             if ((ahora - ultimo_dibujo) > pdMS_TO_TICKS(150)) {
-                int indice_del_disparo = -1;
-                int inicio_busqueda = PUNTOS_PANTALLA / 2;
-                int fin_busqueda = NUM_MUESTRAS - (PUNTOS_PANTALLA / 2);
+                
+                // --- LÓGICA DE DIEZMADO ---
+                int factor = mi_config.tiempo_ms; // 1, 2 o 5
+                int muestras_necesarias = PUNTOS_PANTALLA * factor;
 
-                // Búsqueda del flanco usando mi_config
+                int indice_del_disparo = -1;
+                int inicio_busqueda = muestras_necesarias / 2;
+                int fin_busqueda = NUM_MUESTRAS - (muestras_necesarias / 2);
+
                 for (int i = inicio_busqueda; i < fin_busqueda; i++) {
                     uint32_t anterior = buffer_a_procesar[i - 1];
                     uint32_t actual   = buffer_a_procesar[i];
@@ -353,17 +373,17 @@ void vTriggerTask(void *pvParameters) {
                     indice_del_disparo = NUM_MUESTRAS / 2;
                 }
 
-                int inicio = indice_del_disparo - (PUNTOS_PANTALLA / 2);
+                int inicio = indice_del_disparo - (muestras_necesarias / 2);
 
-                // Empaquetado Aislado para la UART usando mi_config
                 trama_uart_t nueva_trama;
                 nueva_trama.flanco = mi_config.flanco;
                 nueva_trama.nivel = mi_config.nivel;
                 nueva_trama.tiempo = mi_config.tiempo_ms;
                 nueva_trama.amplitud = mi_config.amplitud_v;
 
+                // Aplicación del factor de diezmado al empaquetar
                 for(int i = 0; i < PUNTOS_PANTALLA; i++) {
-                    nueva_trama.ventana[i] = buffer_a_procesar[inicio + i];
+                    nueva_trama.ventana[i] = buffer_a_procesar[inicio + (i * factor)];
                 }
 
                 xQueueSend(Uart_queue, &nueva_trama, 0);
@@ -389,37 +409,11 @@ void vUartTask(void *pvParameters) {
 }
 
 // ====================================================================
-// 6. INICIALIZACIONES SECUNDARIAS
-// ====================================================================
-static void init_pwm_test_signal(void) {
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode       = LEDC_LOW_SPEED_MODE,
-        .timer_num        = LEDC_TIMER_0,
-        .duty_resolution  = LEDC_TIMER_10_BIT, 
-        .freq_hz          = PWM_FREQ_HZ,
-        .clk_cfg          = LEDC_AUTO_CLK
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode     = LEDC_LOW_SPEED_MODE,
-        .channel        = LEDC_CHANNEL_0,
-        .timer_sel      = LEDC_TIMER_0,
-        .intr_type      = LEDC_INTR_DISABLE,
-        .gpio_num       = PWM_OUTPUT_GPIO,
-        .duty           = 512, 
-        .hpoint         = 0
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
-}
-
-// ====================================================================
-// 7. FUNCION PRINCIPAL (DIRECTOR DE ORQUESTA)
+// 6. FUNCION PRINCIPAL (DIRECTOR DE ORQUESTA)
 // ====================================================================
 void app_main(void)
 {
     // --- Interfaces Crudas ---
-    init_pwm_test_signal();
     uart_set_baudrate(UART_NUM_0, 921600);
 
     // --- Colas ---
@@ -432,8 +426,8 @@ void app_main(void)
     config_osciloscopio_t config_inicial = {
         .flanco = FLANCO_DESCENDENTE,
         .nivel = 2000,
-        .tiempo_ms = 50,
-        .amplitud_v = 3.3
+        .tiempo_ms = 1,
+        .amplitud_v = 1.0
     };
     xQueueSend(config_queue, &config_inicial, 0);
 
@@ -472,7 +466,7 @@ void app_main(void)
     static SSD1306_t dev;
 #if CONFIG_I2C_INTERFACE
     ESP_LOGI(TAG, "Iniciando interfaz I2C");
-    i2c_master_init(&dev, CONFIG_SDA_GPIO, CONFIG_SCL_GPIO, CONFIG_RESET_GPIO);
+    i2c_master_init(&dev, 8, 9, -1); //pines SDA=8, SCL=9, sin reset
 #endif
     ssd1306_init(&dev, 128, 64);
     ssd1306_contrast(&dev, 0xff);
@@ -496,8 +490,6 @@ void app_main(void)
     menu_parameters.pcnt_unit = pcnt_unit;
 
     // --- Despliegue de Tareas ---
-    
-    // Core 0: Adquisición Ininterrumpida
     xTaskCreatePinnedToCore(vAdcTask, "vAdcTask", 8192, NULL, 4, &xAdcTaskHandle, 0);
     
     // Core 1: Procesamiento, UI y Comunicación
@@ -507,6 +499,6 @@ void app_main(void)
     xTaskCreatePinnedToCore(vMenuTask, "vMenuTask", 4096, &menu_parameters, 2, NULL, 1);
 
     while (1) {
-        vTaskDelay(portMAX_DELAY);
+        vTaskDelay(portMAX_DELAY); // portMAX_DELAY es un valor especial que indica que la tarea debe esperar indefinidamente. Esto permite que la tarea principal permanezca inactiva mientras las otras tareas realizan su trabajo.
     }
 }
